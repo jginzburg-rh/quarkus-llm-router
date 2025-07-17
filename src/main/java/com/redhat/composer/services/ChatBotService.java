@@ -140,27 +140,52 @@ public class ChatBotService {
         documents
     );
 
+    
     try {
-      String systemMessage = request.getSystemMessage() == null ? defaultSystemMessage : request.getSystemMessage();
-      Multi<String> multi = Multi.createFrom().emitter(em -> {
-        aiService.chatToken(request.getContext(), request.getMessage(), systemMessage)
-        .onPartialResponse(em::emit)
-        .onRetrieved(sources -> {
-          try {
-            em.emit("START_SOURCES_STRING\n");
-            em.emit(objectMapper.writeValueAsString(new ContentResponse(sources)));
-            em.emit("\nEND_SOURCES_STRING\n");
-          } catch (JsonProcessingException e) {
-            Log.error("Sources not processable: %e", e);
-          }
-        })
-        .onError(em::fail)
-        .onCompleteResponse(response -> {
-          em.complete();
-        })
-            .start();
-      });
-      return multi;
+        String systemMessage = request.getSystemMessage() == null ? defaultSystemMessage : request.getSystemMessage();
+        
+        Multi<String> multi = Multi.createFrom().emitter(em -> {
+            try {
+                // PASO 1: Consultar modelo BERT
+                em.emit("🔍 Consultando modelo BERT para determinación inicial...\n\n");
+                
+                BertPredictionResponse bertPrediction = consultBertModel(request.getMessage());
+                
+                em.emit("📊 **Predicción BERT:** " + bertPrediction.getCulpability() + 
+                       " (Confianza: " + String.format("%.2f", bertPrediction.getConfidence()) + ")\n\n");
+                
+                // PASO 2: Construir prompt enriquecido para LLM
+                String enrichedPrompt = buildEnrichedPrompt(request.getMessage(), bertPrediction);
+                
+                em.emit("⚖️ Validando con LLM y leyes de tránsito argentinas...\n\n");
+                
+                // PASO 3: Consultar LLM con prompt enriquecido
+                aiService.chatToken(request.getContext(), enrichedPrompt, systemMessage)
+                    .onPartialResponse(em::emit)
+                    .onRetrieved(sources -> {
+                        try {
+                            em.emit("START_SOURCES_STRING\n");
+                            em.emit(objectMapper.writeValueAsString(new ContentResponse(sources)));
+                            em.emit("\nEND_SOURCES_STRING\n");
+                        } catch (JsonProcessingException e) {
+                            Log.error("Sources not processable: %e", e);
+                        }
+                    })
+                    .onError(em::fail)
+                    .onCompleteResponse(response -> {
+                        em.complete();
+                    })
+                    .start();
+                    
+            } catch (Exception e) {
+                Log.error("Error consulting BERT model", e);
+                em.fail(e);
+            }
+        });
+        
+        return multi;
+         
+    
     } catch (Exception e) {
       Log.error("Error in ChatBotService.chat", e);
       return Multi.createFrom().failure(e);
@@ -228,4 +253,94 @@ public class ChatBotService {
     }
   }
 
+  /**
+   * Consulta el modelo BERT para obtener predicción inicial
+   */
+  private BertPredictionResponse consultBertModel(String siniestroDescription) {
+      try {
+          // Llamada al API REST del modelo BERT
+          String bertApiUrl = configProperties.getBertApiUrl(); // ej: "http://bert-service:8080/predict"
+          
+          BertRequest bertRequest = new BertRequest(siniestroDescription);
+          
+          return restClient.post()
+                  .uri(bertApiUrl)
+                  .bodyValue(bertRequest)
+                  .retrieve()
+                  .bodyToMono(BertPredictionResponse.class)
+                  .block();
+                  
+      } catch (Exception e) {
+          Log.error("Error calling BERT model API", e);
+          // Fallback en caso de error
+          return new BertPredictionResponse("Indeterminado", 0.0);
+      }
+  }
+
+  /**
+   * Construye el prompt enriquecido con la predicción BERT
+   */
+  private String buildEnrichedPrompt(String originalMessage, BertPredictionResponse bertPrediction) {
+      return String.format("""
+          Como experto en seguros y leyes de tránsito argentinas, necesito que analices el siguiente siniestro:
+          
+          **DESCRIPCIÓN DEL SINIESTRO:**
+          %s
+          
+          **PREDICCIÓN INICIAL DEL MODELO BERT:**
+          - Culpabilidad: %s
+          - Nivel de confianza: %.2f
+          
+          **INSTRUCCIONES:**
+          1. Analiza la descripción del siniestro considerando las leyes de tránsito argentinas
+          2. Valida si la predicción BERT es correcta o si difiere tu análisis
+          3. Proporciona una justificación detallada citando los artículos específicos de la ley de tránsito
+          4. Indica si CONFIRMAS, MODIFICAS o RECHAZAS la predicción del modelo BERT
+          
+          **FORMATO DE RESPUESTA:**
+          - **Decisión Final:** [Culpable/No Culpable/Indeterminado]
+          - **Validación BERT:** [Confirmada/Modificada/Rechazada]
+          - **Justificación Legal:** [Cita los artículos específicos]
+          - **Análisis:** [Explicación detallada del razonamiento]
+          
+          Responde de manera profesional y precisa, basándote únicamente en la legislación argentina de tránsito.
+          """, 
+          originalMessage, 
+          bertPrediction.getCulpability(), 
+          bertPrediction.getConfidence()
+      );
+  }
+
+  // Clases de apoyo para la integración con BERT
+  public static class BertRequest {
+      private String description;
+      
+      public BertRequest(String description) {
+          this.description = description;
+      }
+      
+      // getters/setters
+      public String getDescription() { return description; }
+      public void setDescription(String description) { this.description = description; }
+  }
+
+  public static class BertPredictionResponse {
+      private String culpability; // "Culpable", "No Culpable", "Indeterminado"
+      private double confidence;   // 0.0 - 1.0
+      
+      public BertPredictionResponse() {}
+      
+      public BertPredictionResponse(String culpability, double confidence) {
+          this.culpability = culpability;
+          this.confidence = confidence;
+      }
+      
+      // getters/setters
+      public String getCulpability() { return culpability; }
+      public void setCulpability(String culpability) { this.culpability = culpability; }
+      
+      public double getConfidence() { return confidence; }
+      public void setConfidence(double confidence) { this.confidence = confidence; }
+  } 
+  
 }
